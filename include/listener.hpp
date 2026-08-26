@@ -21,6 +21,7 @@
 
 #include "../config/structures.hpp"
 #include "utils.hpp"
+#include <condition_variable>
 
 namespace KMR::CBM
 {
@@ -45,12 +46,14 @@ public:
     bool fbckReceived(int id);
     bool getFeedbacks(int id, float& fbckPosition, float& fbckSpeed,
                       float& fbckTorque, int& fbckTemperature);
+    bool setListenerPriority(int sched_policy, int priority);
 
 private:
     // Thread
     bool m_stopThread = 0;
     std::thread m_thread;
     std::mutex m_mutex;
+    std::condition_variable m_cv;
 
     std::vector<Motor*> m_motors;
     int m_nbrMotors;
@@ -59,6 +62,7 @@ private:
     int listenerLoop(int s);
     void parseFrame(can_frame frame);
     float convertParameter_to_SI(int x, float xMin, float xMax, int bitSize);
+
 };
 
 }

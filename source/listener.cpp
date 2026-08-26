@@ -156,77 +156,83 @@ void Listener::parseFrame(can_frame frame)
 	m_motors[idx]->fbckTemperature = temperature;
 
 	m_motors[idx]->fr_fbckReady = 1;
+	m_cv.notify_all(); //  NEWNotify the main thread that the feedback is ready
 }
-
 
 /**
  * @brief       Check if the query motor sent the response to a previous command
  * @param[in]   id ID of the query motor
  * @retval      1 if the motor answered, 0 if not (timeout)
+ *
+ * RT-safe rewrite: instead of busy-waiting on the mutex, the caller sleeps
+ * on m_cv until either the listener thread signals fr_fbckReady=1 (see
+ * parseFrame) or RESPONSE_TIMEOUT microseconds elapse. This eliminates
+ * the priority-inversion trap where a SCHED_FIFO caller would starve a
+ * SCHED_OTHER listener via mutex contention. [4]
  */
 bool Listener::fbckReceived(int id)
 {
-	int idx = getIndex(m_ids, id);
-	bool available = 0;
+    int idx = getIndex(m_ids, id);
 
-	timespec start = time_s();
-	while (available != 1) {
-		// Check for timeout
-		timespec end = time_s();
-		double elapsed = get_delta_us(end, start);
-		if (elapsed > RESPONSE_TIMEOUT) {
-			cout << "[TIMEOUT] Receiving feedback for motor " << id << " timed out!" << endl;
-			break;
-		}		
+    std::unique_lock<std::mutex> lock(m_mutex);
+    bool ok = m_cv.wait_for(
+        lock,
+        std::chrono::microseconds(RESPONSE_TIMEOUT),
+        [&]{ return m_motors[idx]->fr_fbckReady == 1; }
+    );
 
-		scoped_lock lock(m_mutex);
-		available = m_motors[idx]->fr_fbckReady;
+    if (!ok) {
+        std::cout << "[TIMEOUT] Receiving feedback for motor " << id
+                  << " timed out!" << std::endl;
+        return false;
+    }
 
-		// Clear update flag
-		m_motors[idx]->fr_fbckReady = 0;
-	}
-
-	return available;		
+    // Consume the flag so the next call waits for a fresh reply
+    m_motors[idx]->fr_fbckReady = 0;
+    return true;
 }
-
+	
 
 /**
  * @brief       Get the feedbacks from a query motor, if it was received
  * @param[in]   id ID of the query motor
- * @param[out]	fbckPosition Feedback motor position [rad]
- * @param[out]	fbckSpeed Feedback motor speed [rad/s]
- * @param[out]	fbckTorque Feedback torque [Nm]
- * @param[out]	fbckTemperature Feedback temperature [°C]
+ * @param[out]  fbckPosition Feedback motor position [rad]
+ * @param[out]  fbckSpeed Feedback motor speed [rad/s]
+ * @param[out]  fbckTorque Feedback torque [Nm]
+ * @param[out]  fbckTemperature Feedback temperature [°C]
  * @retval      1 if the motor answered (= valid fbck), 0 if not (timeout)
+ *
+ * RT-safe rewrite: same CV-based wait as fbckReceived(). While holding the
+ * lock after wakeup, we copy the four feedback values out and then clear
+ * the ready flag atomically w.r.t. the listener's parseFrame() writes.
  */
 bool Listener::getFeedbacks(int id, float& fbckPosition, float& fbckSpeed,
-							float& fbckTorque, int& fbckTemperature)
+                            float& fbckTorque, int& fbckTemperature)
 {
-	int idx = getIndex(m_ids, id);
-	bool available = 0;
+    int idx = getIndex(m_ids, id);
 
-	timespec start = time_s();
-	while (available != 1) {
-		// Check for timeout
-		timespec end = time_s();
-		double elapsed = get_delta_us(end, start);
-		if (elapsed > RESPONSE_TIMEOUT) {
-			cout << "[TIMEOUT] Receiving feedback for motor " << id << " timed out!" << endl;
-			break;
-		}		
+    std::unique_lock<std::mutex> lock(m_mutex);
+    bool ok = m_cv.wait_for(
+        lock,
+        std::chrono::microseconds(RESPONSE_TIMEOUT),
+        [&]{ return m_motors[idx]->fr_fbckReady == 1; }
+    );
 
-		scoped_lock lock(m_mutex);
-		available = m_motors[idx]->fr_fbckReady;
-		fbckPosition = m_motors[idx]->fbckPosition;
-		fbckSpeed = m_motors[idx]->fbckSpeed;
-		fbckTorque = m_motors[idx]->fbckTorque;
-		fbckTemperature = m_motors[idx]->fbckTemperature;
+    if (!ok) {
+        std::cout << "[TIMEOUT] Receiving feedback for motor " << id
+                  << " timed out!" << std::endl;
+        return false;
+    }
 
-		// Clear update flag
-		m_motors[idx]->fr_fbckReady = 0;
-	}
+    // Copy feedback values out while still holding the lock
+    fbckPosition    = m_motors[idx]->fbckPosition;
+    fbckSpeed       = m_motors[idx]->fbckSpeed;
+    fbckTorque      = m_motors[idx]->fbckTorque;
+    fbckTemperature = m_motors[idx]->fbckTemperature;
 
-	return available;	
+    // Consume the flag
+    m_motors[idx]->fr_fbckReady = 0;
+    return true;
 }
 
 }
